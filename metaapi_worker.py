@@ -48,13 +48,19 @@ except ImportError:
 import strategy_multitf
 
 # --- Logging: a stdout, con hora, para que el hosting muestre TODO en sus logs.
+# El nivel global queda en WARNING para silenciar el ruido del SDK de MetaApi
+# (socket.io / engine.io / httpx), que ADEMÁS imprime el token JWT dentro de las
+# URLs -> riesgo de seguridad. Solo nuestro logger 'eas-worker' habla en INFO.
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
+for _noisy in ("socketio", "engineio", "httpx", "httpcore", "metaapi", "websockets"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("eas-worker")
+log.setLevel(logging.INFO)
 
 # Cuántas velas pedir por timeframe para evaluar la estrategia multi-TF.
 CANDLES_D1 = 150
@@ -363,4 +369,10 @@ if __name__ == "__main__":
 
     log.info("eas-worker iniciado | panel=%s | cada %ss | health en :%s",
              DASHBOARD_URL, POLL_SECONDS, HEALTH_PORT)
-    asyncio.run(loop())
+    try:
+        asyncio.run(loop())
+    except KeyboardInterrupt:
+        # El SDK de MetaApi deja hilos de fondo (no daemon) que impiden que el
+        # proceso muera con un Ctrl+C normal. Forzamos la salida inmediata.
+        log.info("Detenido por el usuario (Ctrl+C). Cerrando worker.")
+        os._exit(0)
