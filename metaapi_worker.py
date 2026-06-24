@@ -46,6 +46,7 @@ except ImportError:
     pass
 
 import strategy_multitf
+import strategy_asian
 
 # --- Logging: a stdout, con hora, para que el hosting muestre TODO en sus logs.
 # El nivel global queda en WARNING para silenciar el ruido del SDK de MetaApi
@@ -66,6 +67,16 @@ log.setLevel(logging.INFO)
 CANDLES_D1 = 150
 CANDLES_H4 = 300  # 300 H4 -> 150 H8 sintéticas (suficiente para EMA50)
 CANDLES_M5 = 100
+
+# Asian breakout: usa el timeframe del bot. Pedimos suficientes velas para cubrir
+# el día actual (sesión asiática) + el lookback de volumen.
+CANDLES_ASIAN = 400
+
+# Mapa de timeframes del panel (M1..D1) a los de MetaApi (1m..1d).
+METAAPI_TF = {
+    "M1": "1m", "M5": "5m", "M10": "10m", "M15": "15m",
+    "M30": "30m", "H1": "1h", "H4": "4h", "D1": "1d",
+}
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.getenv("BOT_API_KEY", "")
@@ -148,42 +159,84 @@ async def fetch_candles(account, symbol, timeframe, limit):
     return list(reversed(candles or []))
 
 
-async def resolve_direction(account, connection, bot, symbol):
+def _pip_size(spec):
+    """Tamaño de un pip en precio según los dígitos del símbolo."""
+    digits = spec.get("digits", 5)
+    point = 10 ** (-digits)
+    factor = 10 if digits in (3, 5) else 1
+    return point * factor
+
+
+def _respects_configured(configured, direction):
+    """El panel puede restringir el bot a solo compra o solo venta."""
+    return not (configured in ("buy", "sell") and configured != direction)
+
+
+async def resolve_direction(account, connection, bot, symbol, spec):
     """
-    Decide la dirección a operar según la estrategia del bot.
-      - 'multitf_orderflow': evalúa tendencia multi-TF + order flow (parámetros
-        del panel). Devuelve 'buy'/'sell' o None si no hay señal.
+    Decide la dirección a operar según la estrategia del bot. Devuelve una tupla
+    (direction, levels):
+      - direction: 'buy' / 'sell' / 'both' / None (None = no operar este ciclo).
+      - levels: None, o un dict con niveles del rango (solo 'asian_breakout') para
+        que open_operation calcule SL/TP basados en el rango en vez de pips fijos.
+
+    Estrategias:
+      - 'multitf_orderflow': tendencia multi-TF + order flow.
+      - 'asian_breakout': ruptura del rango asiático en sesión Londres/NY.
       - cualquier otra ('simple'): usa la dirección fija configurada.
     Respeta además la restricción de dirección del panel (buy/sell/both).
     """
     configured = bot["entry"]["direction"]  # 'buy' | 'sell' | 'both'
     strategy = bot.get("strategy", "simple")
-
-    if strategy != "multitf_orderflow":
-        return configured  # comportamiento simple original
-
     params = bot.get("parameters", {}) or {}
-    try:
-        d1 = await fetch_candles(account, symbol, "1d", CANDLES_D1)
-        h4 = await fetch_candles(account, symbol, "4h", CANDLES_H4)
-        m5 = await fetch_candles(account, symbol, "5m", CANDLES_M5)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("[%s] %s: no se pudieron leer velas (%s).", bot["name"], symbol, exc)
-        return None
 
-    direction, reason = strategy_multitf.decide(d1, h4, m5, params)
-    if direction is None:
-        log.info("[%s] %s: sin señal (%s).", bot["name"], symbol, reason)
-        return None
+    if strategy == "multitf_orderflow":
+        try:
+            d1 = await fetch_candles(account, symbol, "1d", CANDLES_D1)
+            h4 = await fetch_candles(account, symbol, "4h", CANDLES_H4)
+            m5 = await fetch_candles(account, symbol, "5m", CANDLES_M5)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] %s: no se pudieron leer velas (%s).", bot["name"], symbol, exc)
+            return None, None
 
-    # El panel puede restringir a solo compra o solo venta.
-    if configured in ("buy", "sell") and configured != direction:
-        log.info("[%s] %s: señal %s ignorada (el bot está fijado a %s).",
-                 bot["name"], symbol, direction, configured)
-        return None
+        direction, reason = strategy_multitf.decide(d1, h4, m5, params)
+        if direction is None:
+            log.info("[%s] %s: sin señal (%s).", bot["name"], symbol, reason)
+            return None, None
+        if not _respects_configured(configured, direction):
+            log.info("[%s] %s: señal %s ignorada (el bot está fijado a %s).",
+                     bot["name"], symbol, direction, configured)
+            return None, None
+        log.info("[%s] %s: señal %s (%s).", bot["name"], symbol, direction, reason)
+        return direction, None
 
-    log.info("[%s] %s: señal %s (%s).", bot["name"], symbol, direction, reason)
-    return direction
+    if strategy == "asian_breakout":
+        tf = METAAPI_TF.get(bot.get("timeframe", "M15"), "15m")
+        try:
+            candles = await fetch_candles(account, symbol, tf, CANDLES_ASIAN)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] %s: no se pudieron leer velas %s (%s).", bot["name"], symbol, tf, exc)
+            return None, None
+        if not candles:
+            log.info("[%s] %s: sin velas %s para evaluar.", bot["name"], symbol, tf)
+            return None, None
+
+        server_hour = strategy_asian.broker_hour(candles[-1])
+        direction, reason, levels = strategy_asian.decide(
+            candles, params, server_hour=server_hour, pip_size=_pip_size(spec)
+        )
+        if direction is None:
+            log.info("[%s] %s: sin entrada asian (%s).", bot["name"], symbol, reason)
+            return None, None
+        if not _respects_configured(configured, direction):
+            log.info("[%s] %s: %s ignorada (el bot está fijado a %s).",
+                     bot["name"], symbol, direction, configured)
+            return None, None
+        log.info("[%s] %s: %s (%s).", bot["name"], symbol, direction, reason)
+        return direction, levels
+
+    # 'simple': dirección fija configurada.
+    return configured, None
 
 
 async def open_operation(account, connection, bot, symbol):
@@ -195,10 +248,6 @@ async def open_operation(account, connection, bot, symbol):
         log.info("[%s] %s: ya alcanzo max_open_trades.", bot["name"], symbol)
         return
 
-    direction = await resolve_direction(account, connection, bot, symbol)
-    if direction is None:
-        return  # la estrategia decidió no operar este ciclo
-
     try:
         price = await connection.get_symbol_price(symbol)
         spec = await connection.get_symbol_specification(symbol)
@@ -206,33 +255,68 @@ async def open_operation(account, connection, bot, symbol):
         log.warning("[%s] %s: sin precio/spec (%s).", bot["name"], symbol, exc)
         return
 
-    sl_dist = pips_to_price(spec, entry["stop_loss_pips"])
-    tp_dist = pips_to_price(spec, entry["take_profit_pips"])
+    direction, levels = await resolve_direction(account, connection, bot, symbol, spec)
+    if direction is None:
+        return  # la estrategia decidió no operar este ciclo
+
+    digits = spec.get("digits", 5)
     volume = float(entry["lot_size"])
     options = {"comment": f"Eas:{bot['id']}", "magic": magic}
+
+    # SL/TP: por rango (asian_breakout, cuando hay 'levels') o por pips fijos.
+    sell = direction == "sell"
+    ref = price["bid"] if sell else price["ask"]
+    if levels:
+        sl, tp = _levels_to_sl_tp(sell, ref, levels, digits)
+    else:
+        sl_dist = pips_to_price(spec, entry["stop_loss_pips"])
+        tp_dist = pips_to_price(spec, entry["take_profit_pips"])
+        if sell:
+            sl = round(ref + sl_dist, digits) if sl_dist else None
+            tp = round(ref - tp_dist, digits) if tp_dist else None
+        else:
+            sl = round(ref - sl_dist, digits) if sl_dist else None
+            tp = round(ref + tp_dist, digits) if tp_dist else None
 
     # Modo paper: si el parámetro live_mode está desactivado, solo se loguea
     # la operación que se "habría" abierto (útil para validar en demo).
     params = bot.get("parameters", {}) or {}
     live_mode = bool(params.get("live_mode", True))
     if not live_mode:
-        ref = price["bid"] if direction == "sell" else price["ask"]
-        log.info("[%s] %s: [PAPER] habría abierto %s %s lotes @ %s (live_mode desactivado).",
-                 bot["name"], symbol, direction, volume, ref)
+        log.info("[%s] %s: [PAPER] habría abierto %s %s lotes @ %s (SL %s / TP %s, "
+                 "live_mode desactivado).", bot["name"], symbol, direction, volume, ref, sl, tp)
         return
 
-    if direction == "sell":
-        ref = price["bid"]
-        sl = ref + sl_dist if sl_dist else None
-        tp = ref - tp_dist if tp_dist else None
+    if sell:
         result = await connection.create_market_sell_order(symbol, volume, sl, tp, options)
     else:  # buy o both -> compra por defecto
-        ref = price["ask"]
-        sl = ref - sl_dist if sl_dist else None
-        tp = ref + tp_dist if tp_dist else None
         result = await connection.create_market_buy_order(symbol, volume, sl, tp, options)
 
-    log.info("[%s] %s: %s -> %s", bot["name"], symbol, direction, result.get("stringCode", result))
+    log.info("[%s] %s: %s @ %s (SL %s / TP %s) -> %s",
+             bot["name"], symbol, direction, ref, sl, tp, result.get("stringCode", result))
+
+
+def _levels_to_sl_tp(sell, ref, levels, digits):
+    """
+    SL/TP del breakout asiático a partir del rango (replica el EA original):
+      - SL al otro lado del rango +/- buffer, con un piso mínimo de ATR.
+      - TP a una distancia = SL * ratio R:R.
+    """
+    atr_floor = levels.get("atr_floor", 0.0)
+    rr = levels.get("rr", 2.0)
+    if sell:
+        sl = levels["range_high"] + levels["eff_buffer"]
+        if atr_floor > 0 and (sl - ref) < atr_floor:
+            sl = ref + atr_floor
+        sl_dist = sl - ref
+        tp = ref - sl_dist * rr
+    else:
+        sl = levels["range_low"] - levels["eff_buffer"]
+        if atr_floor > 0 and (ref - sl) < atr_floor:
+            sl = ref - atr_floor
+        sl_dist = ref - sl
+        tp = ref + sl_dist * rr
+    return round(sl, digits), round(tp, digits)
 
 
 async def manage_trailing_stops(connection, bot, symbol):
