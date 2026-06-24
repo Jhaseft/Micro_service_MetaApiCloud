@@ -14,14 +14,26 @@ Flujo (cada POLL_SECONDS):
        - evalúa la estrategia y abre operaciones (respetando horario y máximos).
   3. Repite.
 
+Este worker NO es una web, pero levanta un pequeño servidor de salud para que
+el hosting (Render/Railway/Coolify) no devuelva 404 al entrar a la raíz: la
+ruta `/` y `/health` responden el estado actual en JSON.
+
 Config por variables de entorno (o archivo .env en esta carpeta):
     DASHBOARD_URL   URL pública del panel (ej. https://tu-panel.com)
     BOT_API_KEY     misma clave que BOT_API_KEY en el .env del panel
     POLL_SECONDS    cada cuántos segundos consulta el panel (ej. 30)
+    PORT            puerto del servidor de salud (lo inyecta el hosting; def 8080)
 """
 
 import asyncio
+import json
+import logging
 import os
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 from metaapi_cloud_sdk import MetaApi
@@ -35,6 +47,15 @@ except ImportError:
 
 import strategy_multitf
 
+# --- Logging: a stdout, con hora, para que el hosting muestre TODO en sus logs.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("eas-worker")
+
 # Cuántas velas pedir por timeframe para evaluar la estrategia multi-TF.
 CANDLES_D1 = 150
 CANDLES_H4 = 300  # 300 H4 -> 150 H8 sintéticas (suficiente para EMA50)
@@ -43,9 +64,51 @@ CANDLES_M5 = 100
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+HEALTH_PORT = int(os.getenv("PORT", "8080"))
 
 ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/accounts"
 HEADERS = {"X-API-Key": API_KEY}
+
+# Estado compartido que expone el servidor de salud (se actualiza cada ciclo).
+STATUS = {
+    "service": "eas-worker",
+    "ok": True,
+    "started_at": None,
+    "panel": DASHBOARD_URL,
+    "poll_seconds": POLL_SECONDS,
+    "cycles": 0,
+    "last_poll": None,
+    "accounts": 0,
+    "last_error": None,
+}
+
+
+# --------------------------------------------------------------------------- #
+#  Servidor de salud (arregla el 404 en la raíz)
+# --------------------------------------------------------------------------- #
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Responde el estado del worker en `/` y `/health` (JSON, 200)."""
+
+    def do_GET(self):  # noqa: N802 (nombre lo fija la librería)
+        body = json.dumps(STATUS, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # silencia el log ruidoso por request
+        log.debug("health %s", fmt % args)
+
+
+def start_health_server():
+    """Levanta el servidor de salud en un hilo de fondo (no bloquea el worker)."""
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info(
+        "Servidor de salud escuchando en http://0.0.0.0:%s/ "
+        "(la raíz ya responde estado, no 404).", HEALTH_PORT
+    )
 
 
 def fetch_accounts():
@@ -99,21 +162,21 @@ async def resolve_direction(account, connection, bot, symbol):
         h4 = await fetch_candles(account, symbol, "4h", CANDLES_H4)
         m5 = await fetch_candles(account, symbol, "5m", CANDLES_M5)
     except Exception as exc:  # noqa: BLE001
-        print(f"  [{bot['name']}] {symbol}: no se pudieron leer velas ({exc}).")
+        log.warning("[%s] %s: no se pudieron leer velas (%s).", bot["name"], symbol, exc)
         return None
 
     direction, reason = strategy_multitf.decide(d1, h4, m5, params)
     if direction is None:
-        print(f"  [{bot['name']}] {symbol}: sin señal ({reason}).")
+        log.info("[%s] %s: sin señal (%s).", bot["name"], symbol, reason)
         return None
 
     # El panel puede restringir a solo compra o solo venta.
     if configured in ("buy", "sell") and configured != direction:
-        print(f"  [{bot['name']}] {symbol}: señal {direction} ignorada "
-              f"(el bot está fijado a {configured}).")
+        log.info("[%s] %s: señal %s ignorada (el bot está fijado a %s).",
+                 bot["name"], symbol, direction, configured)
         return None
 
-    print(f"  [{bot['name']}] {symbol}: señal {direction} ({reason}).")
+    log.info("[%s] %s: señal %s (%s).", bot["name"], symbol, direction, reason)
     return direction
 
 
@@ -123,7 +186,7 @@ async def open_operation(account, connection, bot, symbol):
     magic = 1000000 + int(bot["id"])
 
     if await count_open_positions(connection, symbol, magic) >= entry["max_open_trades"]:
-        print(f"  [{bot['name']}] {symbol}: ya alcanzo max_open_trades.")
+        log.info("[%s] %s: ya alcanzo max_open_trades.", bot["name"], symbol)
         return
 
     direction = await resolve_direction(account, connection, bot, symbol)
@@ -134,7 +197,7 @@ async def open_operation(account, connection, bot, symbol):
         price = await connection.get_symbol_price(symbol)
         spec = await connection.get_symbol_specification(symbol)
     except Exception as exc:  # noqa: BLE001
-        print(f"  [{bot['name']}] {symbol}: sin precio/spec ({exc}).")
+        log.warning("[%s] %s: sin precio/spec (%s).", bot["name"], symbol, exc)
         return
 
     sl_dist = pips_to_price(spec, entry["stop_loss_pips"])
@@ -148,8 +211,8 @@ async def open_operation(account, connection, bot, symbol):
     live_mode = bool(params.get("live_mode", True))
     if not live_mode:
         ref = price["bid"] if direction == "sell" else price["ask"]
-        print(f"  [{bot['name']}] {symbol}: [PAPER] habría abierto {direction} "
-              f"{volume} lotes @ {ref} (live_mode desactivado).")
+        log.info("[%s] %s: [PAPER] habría abierto %s %s lotes @ %s (live_mode desactivado).",
+                 bot["name"], symbol, direction, volume, ref)
         return
 
     if direction == "sell":
@@ -163,7 +226,7 @@ async def open_operation(account, connection, bot, symbol):
         tp = ref + tp_dist if tp_dist else None
         result = await connection.create_market_buy_order(symbol, volume, sl, tp, options)
 
-    print(f"  [{bot['name']}] {symbol}: {direction} -> {result.get('stringCode', result)}")
+    log.info("[%s] %s: %s -> %s", bot["name"], symbol, direction, result.get("stringCode", result))
 
 
 async def manage_trailing_stops(connection, bot, symbol):
@@ -189,7 +252,7 @@ async def manage_trailing_stops(connection, bot, symbol):
         price = await connection.get_symbol_price(symbol)
         spec = await connection.get_symbol_specification(symbol)
     except Exception as exc:  # noqa: BLE001
-        print(f"  [{bot['name']}] {symbol}: trailing sin precio/spec ({exc}).")
+        log.warning("[%s] %s: trailing sin precio/spec (%s).", bot["name"], symbol, exc)
         return
 
     trail_dist = pips_to_price(spec, trailing_pips)
@@ -216,9 +279,10 @@ async def manage_trailing_stops(connection, bot, symbol):
 
         try:
             await connection.modify_position(pid, new_sl, cur_tp)
-            print(f"  [{bot['name']}] {symbol}: trailing -> SL movido a {round(new_sl, 6)} (pos {pid}).")
+            log.info("[%s] %s: trailing -> SL movido a %s (pos %s).",
+                     bot["name"], symbol, round(new_sl, 6), pid)
         except Exception as exc:  # noqa: BLE001
-            print(f"  [{bot['name']}] {symbol}: no se pudo mover SL de {pid} ({exc}).")
+            log.warning("[%s] %s: no se pudo mover SL de %s (%s).", bot["name"], symbol, pid, exc)
 
 
 async def process_account(api, account_data):
@@ -226,8 +290,10 @@ async def process_account(api, account_data):
     account_id = account_data["metaapi_account_id"]
     bots = account_data.get("bots", [])
     if not bots:
+        log.info("Cuenta %s: sin bots activos, se omite.", account_id)
         return
 
+    log.info("Cuenta %s: procesando %s bot(s)...", account_id, len(bots))
     account = await api.metatrader_account_api.get_account(account_id)
     connection = account.get_rpc_connection()
     await connection.connect()
@@ -242,7 +308,7 @@ async def process_account(api, account_data):
 
             # 2) Apertura de nuevas operaciones: solo dentro del horario.
             if not bot.get("within_trading_window", True):
-                print(f"  [{bot['name']}] fuera de horario, no abre nuevas.")
+                log.info("[%s] fuera de horario, no abre nuevas.", bot["name"])
                 continue
             for symbol in bot.get("symbols", []):
                 await open_operation(account, connection, bot, symbol)
@@ -252,26 +318,49 @@ async def process_account(api, account_data):
 
 async def loop():
     while True:
+        cycle_start = time.time()
+        STATUS["cycles"] += 1
+        cycle = STATUS["cycles"]
+        log.info("Ciclo #%s: consultando panel %s ...", cycle, ACCOUNTS_ENDPOINT)
         try:
             token, accounts = fetch_accounts()
+            STATUS["last_poll"] = datetime.now(timezone.utc).isoformat()
+            STATUS["accounts"] = len(accounts)
             if not token:
-                print("El panel no devolvio METAAPI_TOKEN. Configuralo en el .env del panel.")
+                log.warning("El panel no devolvió METAAPI_TOKEN. Configuralo en el .env del panel.")
             else:
                 api = MetaApi(token)
-                print(f"Cuentas operables: {len(accounts)}")
+                log.info("Cuentas operables: %s", len(accounts))
                 for account_data in accounts:
                     try:
                         await process_account(api, account_data)
                     except Exception as exc:  # noqa: BLE001
-                        print(f"Cuenta {account_data.get('metaapi_account_id')}: error {exc}")
+                        STATUS["last_error"] = str(exc)
+                        log.exception("Cuenta %s: error", account_data.get("metaapi_account_id"))
+            STATUS["ok"] = True
         except Exception as exc:  # noqa: BLE001
-            print("Error en el ciclo:", exc)
+            STATUS["ok"] = False
+            STATUS["last_error"] = str(exc)
+            log.exception("Error en el ciclo")
 
+        elapsed = time.time() - cycle_start
+        log.info("Ciclo #%s terminado en %.1fs. Próxima consulta en %ss.",
+                 cycle, elapsed, POLL_SECONDS)
         await asyncio.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
+    # Arranca el servidor de salud SIEMPRE (aunque falte config) para que el
+    # hosting vea el puerto vivo y la raíz no dé 404.
+    STATUS["started_at"] = datetime.now(timezone.utc).isoformat()
+    start_health_server()
+
     if not API_KEY:
-        raise SystemExit("Define BOT_API_KEY en el entorno o en el archivo .env.")
-    print(f"eas-worker iniciado | panel={DASHBOARD_URL} | cada {POLL_SECONDS}s")
+        STATUS["ok"] = False
+        STATUS["last_error"] = "Falta BOT_API_KEY"
+        log.error("Define BOT_API_KEY en el entorno o en el archivo .env.")
+        raise SystemExit(1)
+
+    log.info("eas-worker iniciado | panel=%s | cada %ss | health en :%s",
+             DASHBOARD_URL, POLL_SECONDS, HEALTH_PORT)
     asyncio.run(loop())
