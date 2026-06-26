@@ -167,6 +167,46 @@ def _pip_size(spec):
     return point * factor
 
 
+def _min_stop_distance(spec):
+    """
+    Distancia mínima (en PRECIO) que el broker exige entre el precio actual y
+    el SL/TP. Si SL/TP quedan más cerca que esto, MetaApi devuelve
+    'Invalid stops in the request'. El campo viene en 'points' (stopsLevel).
+    """
+    stops_level = spec.get("stopsLevel") or spec.get("stops_level") or 0
+    digits = spec.get("digits", 5)
+    point = 10 ** (-digits)
+    return float(stops_level) * point
+
+
+def _enforce_min_stops(sell, ref, sl, tp, min_dist, digits, bot, symbol):
+    """
+    Aleja SL/TP hasta la distancia mínima del broker para evitar el rechazo
+    'Invalid stops'. Avisa por log cuando tiene que corregir un nivel.
+    """
+    if not min_dist:
+        return sl, tp
+    if sell:
+        if sl is not None and (sl - ref) < min_dist:
+            sl = round(ref + min_dist, digits)
+            log.warning("[%s] %s: SL muy ajustado, movido al mínimo del broker (%s).",
+                        bot["name"], symbol, sl)
+        if tp is not None and (ref - tp) < min_dist:
+            tp = round(ref - min_dist, digits)
+            log.warning("[%s] %s: TP muy ajustado, movido al mínimo del broker (%s).",
+                        bot["name"], symbol, tp)
+    else:
+        if sl is not None and (ref - sl) < min_dist:
+            sl = round(ref - min_dist, digits)
+            log.warning("[%s] %s: SL muy ajustado, movido al mínimo del broker (%s).",
+                        bot["name"], symbol, sl)
+        if tp is not None and (tp - ref) < min_dist:
+            tp = round(ref + min_dist, digits)
+            log.warning("[%s] %s: TP muy ajustado, movido al mínimo del broker (%s).",
+                        bot["name"], symbol, tp)
+    return sl, tp
+
+
 def _respects_configured(configured, direction):
     """El panel puede restringir el bot a solo compra o solo venta."""
     return not (configured in ("buy", "sell") and configured != direction)
@@ -278,6 +318,11 @@ async def open_operation(account, connection, bot, symbol):
             sl = round(ref - sl_dist, digits) if sl_dist else None
             tp = round(ref + tp_dist, digits) if tp_dist else None
 
+    # El broker rechaza ('Invalid stops') SL/TP más cerca del precio que su
+    # distancia mínima. Los alejamos hasta ese mínimo antes de enviar.
+    min_dist = _min_stop_distance(spec)
+    sl, tp = _enforce_min_stops(sell, ref, sl, tp, min_dist, digits, bot, symbol)
+
     # Modo paper: si el parámetro live_mode está desactivado, solo se loguea
     # la operación que se "habría" abierto (útil para validar en demo).
     params = bot.get("parameters", {}) or {}
@@ -286,6 +331,9 @@ async def open_operation(account, connection, bot, symbol):
         log.info("[%s] %s: [PAPER] habría abierto %s %s lotes @ %s (SL %s / TP %s, "
                  "live_mode desactivado).", bot["name"], symbol, direction, volume, ref, sl, tp)
         return
+
+    log.info("[%s] %s: enviando %s %s lotes @ %s (SL %s / TP %s, min_dist %s)",
+             bot["name"], symbol, direction, volume, ref, sl, tp, min_dist)
 
     if sell:
         result = await connection.create_market_sell_order(symbol, volume, sl, tp, options)
