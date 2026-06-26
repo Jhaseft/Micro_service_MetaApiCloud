@@ -428,6 +428,23 @@ async def loop():
                         STATUS["last_error"] = str(exc)
                         log.exception("Cuenta %s: error", account_data.get("metaapi_account_id"))
             STATUS["ok"] = True
+        except requests.exceptions.HTTPError as exc:
+            STATUS["ok"] = False
+            status_code = exc.response.status_code if exc.response is not None else None
+            STATUS["last_error"] = f"HTTP {status_code} en {ACCOUNTS_ENDPOINT}"
+            if status_code in (401, 403):
+                log.error(
+                    "El panel rechazó la API key (HTTP %s). La BOT_API_KEY del worker "
+                    "NO coincide con la del panel. Revisa que sean idénticas (sin "
+                    "comillas ni espacios) y reinicia ambos servicios.", status_code
+                )
+            elif status_code == 503:
+                log.error(
+                    "El panel no tiene configurada BOT_API_KEY (HTTP 503). Define "
+                    "BOT_API_KEY en las variables del panel y reinícialo."
+                )
+            else:
+                log.error("El panel respondió HTTP %s al pedir las cuentas.", status_code)
         except Exception as exc:  # noqa: BLE001
             STATUS["ok"] = False
             STATUS["last_error"] = str(exc)
