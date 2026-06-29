@@ -61,6 +61,19 @@ logging.basicConfig(
 )
 for _noisy in ("socketio", "engineio", "httpx", "httpcore", "metaapi", "websockets"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# El SDK de MetaApi por defecto IMPRIME (print) sus logs en vez de usar logging,
+# incluido el ruido de "Failed to subscribe" cuando una cuenta NO está conectada
+# al broker. Lo enrutamos por logging y silenciamos esos dos emisores: ese error
+# ya lo manejamos nosotros saltando las cuentas desconectadas.
+try:
+    from metaapi_cloud_sdk.logger import LoggerManager
+    LoggerManager.use_logging()
+except Exception:  # noqa: BLE001
+    pass
+for _sdk_noisy in ("SubscriptionManager", "MetaApiWebsocketClient"):
+    logging.getLogger(_sdk_noisy).setLevel(logging.CRITICAL)
+
 log = logging.getLogger("eas-worker")
 log.setLevel(logging.INFO)
 
