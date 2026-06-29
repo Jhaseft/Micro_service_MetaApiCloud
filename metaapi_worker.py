@@ -90,6 +90,7 @@ HEALTH_PORT = int(os.getenv("PORT", "8080"))
 ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/accounts"
 COPY_ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/copy-accounts"
 COPY_TRADES_ENDPOINT = f"{DASHBOARD_URL}/api/worker/copy-trades"
+TRADES_ENDPOINT = f"{DASHBOARD_URL}/api/worker/trades"
 HEADERS = {"X-API-Key": API_KEY}
 
 # Estado compartido que expone el servidor de salud (se actualiza cada ciclo).
@@ -165,6 +166,22 @@ def report_copy_trades(opened, closed):
     resp.raise_for_status()
 
 
+def report_trade(payload):
+    """
+    Avisa al panel del resultado de un intento de operacion. status puede ser:
+      - 'opened'          la operacion se abrio bien (incluye position_id).
+      - 'rejected_limits' no se abrio porque el SL/TP excede los limites del broker.
+      - 'failed'          no se abrio por otro error de MetaApi.
+
+    Es "best effort": si el panel no responde, solo lo logueamos y seguimos; no
+    queremos que un fallo de reporte detenga el trading.
+    """
+    try:
+        requests.post(TRADES_ENDPOINT, headers=HEADERS, json=payload, timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("No se pudo reportar la operacion al panel (%s).", exc)
+
+
 def pips_to_price(spec, pips):
     """Convierte pips a distancia de precio segun los digitos del simbolo."""
     if pips is None:
@@ -208,32 +225,30 @@ def _min_stop_distance(spec):
     return float(stops_level) * point
 
 
-def _enforce_min_stops(sell, ref, sl, tp, min_dist, digits, bot, symbol):
+def _stops_violation(sell, ref, sl, tp, min_dist):
     """
-    Aleja SL/TP hasta la distancia mínima del broker para evitar el rechazo
-    'Invalid stops'. Avisa por log cuando tiene que corregir un nivel.
+    Comprueba si el SL/TP quedaría más cerca del precio que la distancia mínima
+    que exige el broker (en cuyo caso el broker devolvería 'Invalid stops' y la
+    operación no entraría). Devuelve un texto explicando el problema, o None si
+    los niveles son válidos.
     """
     if not min_dist:
-        return sl, tp
+        return None
+    problems = []
     if sell:
         if sl is not None and (sl - ref) < min_dist:
-            sl = round(ref + min_dist, digits)
-            log.warning("[%s] %s: SL muy ajustado, movido al mínimo del broker (%s).",
-                        bot["name"], symbol, sl)
+            problems.append("SL")
         if tp is not None and (ref - tp) < min_dist:
-            tp = round(ref - min_dist, digits)
-            log.warning("[%s] %s: TP muy ajustado, movido al mínimo del broker (%s).",
-                        bot["name"], symbol, tp)
+            problems.append("TP")
     else:
         if sl is not None and (ref - sl) < min_dist:
-            sl = round(ref - min_dist, digits)
-            log.warning("[%s] %s: SL muy ajustado, movido al mínimo del broker (%s).",
-                        bot["name"], symbol, sl)
+            problems.append("SL")
         if tp is not None and (tp - ref) < min_dist:
-            tp = round(ref + min_dist, digits)
-            log.warning("[%s] %s: TP muy ajustado, movido al mínimo del broker (%s).",
-                        bot["name"], symbol, tp)
-    return sl, tp
+            problems.append("TP")
+    if not problems:
+        return None
+    return (f"{' y '.join(problems)} fuera de los límites del broker "
+            f"(distancia mínima requerida: {min_dist}).")
 
 
 def _respects_configured(configured, direction):
@@ -308,7 +323,7 @@ async def resolve_direction(account, connection, bot, symbol, spec):
     return configured, None
 
 
-async def open_operation(account, connection, bot, symbol):
+async def open_operation(account, connection, bot, symbol, broker_account_id=None):
     """Abre una operacion para un bot+simbolo via MetaApi."""
     entry = bot["entry"]
     magic = 1000000 + int(bot["id"])
@@ -348,9 +363,22 @@ async def open_operation(account, connection, bot, symbol):
             tp = round(ref + tp_dist, digits) if tp_dist else None
 
     # El broker rechaza ('Invalid stops') SL/TP más cerca del precio que su
-    # distancia mínima. Los alejamos hasta ese mínimo antes de enviar.
+    # distancia mínima. Antes los corregíamos en silencio; ahora, si la operación
+    # quedaría fuera de los límites del broker, NO se abre y se avisa al panel.
+    base_report = {
+        "bot_id": int(bot["id"]),
+        "broker_account_id": broker_account_id,
+        "symbol": symbol,
+        "direction": direction if direction in ("buy", "sell") else "buy",
+        "requested_sl": sl,
+        "requested_tp": tp,
+    }
     min_dist = _min_stop_distance(spec)
-    sl, tp = _enforce_min_stops(sell, ref, sl, tp, min_dist, digits, bot, symbol)
+    violation = _stops_violation(sell, ref, sl, tp, min_dist)
+    if violation:
+        log.warning("[%s] %s: NO se abre, %s", bot["name"], symbol, violation)
+        report_trade({**base_report, "status": "rejected_limits", "error": violation})
+        return
 
     # Modo paper: si el parámetro live_mode está desactivado, solo se loguea
     # la operación que se "habría" abierto (útil para validar en demo).
@@ -364,13 +392,24 @@ async def open_operation(account, connection, bot, symbol):
     log.info("[%s] %s: enviando %s %s lotes @ %s (SL %s / TP %s, min_dist %s)",
              bot["name"], symbol, direction, volume, ref, sl, tp, min_dist)
 
-    if sell:
-        result = await connection.create_market_sell_order(symbol, volume, sl, tp, options)
-    else:  # buy o both -> compra por defecto
-        result = await connection.create_market_buy_order(symbol, volume, sl, tp, options)
+    try:
+        if sell:
+            result = await connection.create_market_sell_order(symbol, volume, sl, tp, options)
+        else:  # buy o both -> compra por defecto
+            result = await connection.create_market_buy_order(symbol, volume, sl, tp, options)
+    except Exception as exc:  # noqa: BLE001
+        # No se pudo abrir (stops inválidos, margen, símbolo, etc.). Avisamos al
+        # panel y seguimos con el resto de bots en vez de cortar la cuenta.
+        msg = str(exc)
+        status = "rejected_limits" if "stop" in msg.lower() else "failed"
+        log.warning("[%s] %s: MetaApi rechazó la orden (%s).", bot["name"], symbol, msg)
+        report_trade({**base_report, "status": status, "error": msg})
+        return
 
+    position_id = result.get("positionId") or result.get("orderId")
     log.info("[%s] %s: %s @ %s (SL %s / TP %s) -> %s",
              bot["name"], symbol, direction, ref, sl, tp, result.get("stringCode", result))
+    report_trade({**base_report, "status": "opened", "position_id": str(position_id) if position_id else None})
 
 
 def _levels_to_sl_tp(sell, ref, levels, digits):
@@ -455,6 +494,7 @@ async def manage_trailing_stops(connection, bot, symbol):
 async def process_account(api, account_data):
     """Conecta una cuenta MetaApi y procesa sus bots activos."""
     account_id = account_data["metaapi_account_id"]
+    broker_account_id = account_data.get("broker_account_id")
     bots = account_data.get("bots", [])
     if not bots:
         log.info("Cuenta %s: sin bots activos, se omite.", account_id)
@@ -478,7 +518,7 @@ async def process_account(api, account_data):
                 log.info("[%s] fuera de horario, no abre nuevas.", bot["name"])
                 continue
             for symbol in bot.get("symbols", []):
-                await open_operation(account, connection, bot, symbol)
+                await open_operation(account, connection, bot, symbol, broker_account_id)
     finally:
         await connection.close()
 
