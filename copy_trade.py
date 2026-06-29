@@ -164,6 +164,18 @@ class CopyManager:
         ctx = MasterCtx(master)
         try:
             account = await self.api.metatrader_account_api.get_account(mid)
+
+            # No intentar suscribir si el terminal aún no conectó al bróker:
+            # evita timeouts y tracebacks de "not connected to broker yet".
+            try:
+                await account.reload()
+            except Exception:  # noqa: BLE001
+                pass
+            if account.connection_status != "CONNECTED":
+                log.warning("Copy: maestra %s aún no conectada al bróker (estado: %s); se reintenta luego.",
+                            mid, account.connection_status)
+                return
+
             conn = account.get_streaming_connection()
             conn.add_synchronization_listener(_MasterListener(self, mid))
             await conn.connect()

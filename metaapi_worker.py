@@ -491,6 +491,29 @@ async def manage_trailing_stops(connection, bot, symbol):
             log.warning("[%s] %s: no se pudo mover SL de %s (%s).", bot["name"], symbol, pid, exc)
 
 
+async def is_broker_connected(account, account_id):
+    """
+    Refresca el estado de la cuenta y devuelve True solo si el terminal de la
+    nube YA está conectado al bróker. Evita intentar sincronizar (y llenar de
+    tracebacks) cuentas que aún están conectándose o tienen credenciales malas.
+    """
+    try:
+        await account.reload()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cuenta %s: no se pudo refrescar estado (%s).", account_id, exc)
+        return False
+
+    status = account.connection_status
+    if status != "CONNECTED":
+        log.warning(
+            "Cuenta %s: aún no conectada al bróker (estado: %s). Si persiste, "
+            "revisa login/servidor/contraseña. Se omite este ciclo.",
+            account_id, status,
+        )
+        return False
+    return True
+
+
 async def process_account(api, account_data):
     """Conecta una cuenta MetaApi y procesa sus bots activos."""
     account_id = account_data["metaapi_account_id"]
@@ -500,12 +523,19 @@ async def process_account(api, account_data):
         log.info("Cuenta %s: sin bots activos, se omite.", account_id)
         return
 
-    log.info("Cuenta %s: procesando %s bot(s)...", account_id, len(bots))
     account = await api.metatrader_account_api.get_account(account_id)
+    if not await is_broker_connected(account, account_id):
+        return
+
+    log.info("Cuenta %s: procesando %s bot(s)...", account_id, len(bots))
     connection = account.get_rpc_connection()
     await connection.connect()
     try:
-        await connection.wait_synchronized(60)
+        try:
+            await connection.wait_synchronized(60)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Cuenta %s: no sincronizó a tiempo (%s); se reintenta luego.", account_id, exc)
+            return
 
         for bot in bots:
             # 1) Trailing stop: protege posiciones abiertas SIEMPRE (incluso fuera
