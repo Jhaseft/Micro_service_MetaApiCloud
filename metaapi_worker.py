@@ -47,6 +47,7 @@ except ImportError:
 
 import strategy_multitf
 import strategy_asian
+import copy_trade
 
 # --- Logging: a stdout, con hora, para que el hosting muestre TODO en sus logs.
 # El nivel global queda en WARNING para silenciar el ruido del SDK de MetaApi
@@ -81,9 +82,14 @@ METAAPI_TF = {
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+# Cada cuánto se REFRESCA la configuración de copy (quién sigue a quién). Las
+# operaciones NO se pollean: llegan por eventos de streaming.
+COPY_CONFIG_SECONDS = int(os.getenv("COPY_CONFIG_SECONDS", "60"))
 HEALTH_PORT = int(os.getenv("PORT", "8080"))
 
 ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/accounts"
+COPY_ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/copy-accounts"
+COPY_TRADES_ENDPOINT = f"{DASHBOARD_URL}/api/worker/copy-trades"
 HEADERS = {"X-API-Key": API_KEY}
 
 # Estado compartido que expone el servidor de salud (se actualiza cada ciclo).
@@ -97,6 +103,10 @@ STATUS = {
     "last_poll": None,
     "accounts": 0,
     "last_error": None,
+    "copy_cycles": 0,
+    "copy_last_poll": None,
+    "copy_masters": 0,
+    "copy_last_error": None,
 }
 
 
@@ -134,6 +144,25 @@ def fetch_accounts():
     resp.raise_for_status()
     data = resp.json()
     return data.get("metaapi_token"), data.get("accounts", [])
+
+
+def fetch_copy_accounts():
+    """Devuelve (metaapi_token, [maestras]) para el copy-trading."""
+    resp = requests.get(COPY_ACCOUNTS_ENDPOINT, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("metaapi_token"), data.get("masters", [])
+
+
+def report_copy_trades(opened, closed):
+    """Reporta al panel las aperturas/cierres de copia ejecutadas este ciclo."""
+    resp = requests.post(
+        COPY_TRADES_ENDPOINT,
+        headers=HEADERS,
+        json={"opened": opened, "closed": closed},
+        timeout=20,
+    )
+    resp.raise_for_status()
 
 
 def pips_to_price(spec, pips):
@@ -504,6 +533,49 @@ async def loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
+async def copy_loop():
+    """
+    Copy-trading por EVENTOS (streaming), sin polling de operaciones.
+
+    Este bucle SOLO refresca la configuración (qué maestras y esclavas hay) cada
+    COPY_CONFIG_SECONDS. Las aperturas/cierres reales las disparan los eventos de
+    streaming dentro de CopyManager, no este bucle.
+    """
+    manager = None
+    manager_token = None
+
+    while True:
+        STATUS["copy_cycles"] += 1
+        try:
+            token, masters = fetch_copy_accounts()
+            STATUS["copy_last_poll"] = datetime.now(timezone.utc).isoformat()
+            STATUS["copy_masters"] = len(masters)
+
+            if not token:
+                log.warning("Copy: el panel no devolvió METAAPI_TOKEN; no se copia.")
+            else:
+                if manager is None or token != manager_token:
+                    manager = copy_trade.CopyManager(MetaApi(token), report_copy_trades)
+                    manager_token = token
+                await manager.sync_config(masters)
+
+            STATUS["copy_last_error"] = None
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            STATUS["copy_last_error"] = f"HTTP {status_code} en {COPY_ACCOUNTS_ENDPOINT}"
+            log.error("Copy: el panel respondió HTTP %s al pedir las maestras.", status_code)
+        except Exception as exc:  # noqa: BLE001
+            STATUS["copy_last_error"] = str(exc)
+            log.exception("Copy: error refrescando configuración")
+
+        await asyncio.sleep(COPY_CONFIG_SECONDS)
+
+
+async def main():
+    """Corre el bucle de bots y el de copy-trading en paralelo."""
+    await asyncio.gather(loop(), copy_loop())
+
+
 if __name__ == "__main__":
     # Arranca el servidor de salud SIEMPRE (aunque falte config) para que el
     # hosting vea el puerto vivo y la raíz no dé 404.
@@ -516,10 +588,10 @@ if __name__ == "__main__":
         log.error("Define BOT_API_KEY en el entorno o en el archivo .env.")
         raise SystemExit(1)
 
-    log.info("eas-worker iniciado | panel=%s | cada %ss | health en :%s",
-             DASHBOARD_URL, POLL_SECONDS, HEALTH_PORT)
+    log.info("eas-worker iniciado | panel=%s | bots cada %ss | copy por eventos (config cada %ss) | health en :%s",
+             DASHBOARD_URL, POLL_SECONDS, COPY_CONFIG_SECONDS, HEALTH_PORT)
     try:
-        asyncio.run(loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
         # El SDK de MetaApi deja hilos de fondo (no daemon) que impiden que el
         # proceso muera con un Ctrl+C normal. Forzamos la salida inmediata.
