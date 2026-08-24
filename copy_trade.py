@@ -65,6 +65,27 @@ def _direction_from_type(ptype):
     return None
 
 
+def _connection_ready(conn):
+    """
+    True solo si la conexión de streaming está sincronizada y conectada al bróker.
+
+    Reconciliar (sobre todo CERRAR) sobre un estado a medio sincronizar es
+    peligroso: `terminal_state.positions` puede llegar vacío durante un re-sync o
+    reconexión y hacernos creer que la maestra cerró todo. Es defensivo: si el SDK
+    no expone alguna de estas señales, no bloquea (asume listo) — el segundo cerrojo
+    (re-verificación por RPC antes de un cierre masivo) cubre ese caso.
+    """
+    if getattr(conn, "synchronized", None) is False:
+        return False
+    ts = getattr(conn, "terminal_state", None)
+    if ts is not None:
+        if getattr(ts, "connected_to_broker", True) is False:
+            return False
+        if getattr(ts, "connected", True) is False:
+            return False
+    return True
+
+
 def _slave_lot(master_lot, slave):
     """Lote a abrir en la esclava según su modo de copia (mín. 0.01)."""
     mode = slave.get("copy_mode", "multiplier")
@@ -195,6 +216,23 @@ class CopyManager:
                 pass
         log.info("Copy: maestra %s desconectada (ya no tiene esclavas activas).", mid)
 
+    async def _master_really_flat(self, mid):
+        """
+        Confirma por RPC (canal independiente del streaming) que la maestra
+        realmente no tiene posiciones abiertas. Devuelve True solo si el RPC la ve
+        plana; devuelve False si ve posiciones O si no se pudo confirmar — en ambos
+        casos preferimos NO cerrar (conservador con dinero real).
+        """
+        try:
+            conn = await self.pool.get(mid)
+            positions = await conn.get_positions()
+            return not positions
+        except Exception as exc:  # noqa: BLE001
+            await self.pool.drop(mid)
+            log.warning("Copy: no se pudo verificar por RPC la maestra %s (%s); "
+                        "no se cierra por precaución.", mid, exc)
+            return False
+
     async def reconcile(self, mid):
         """Iguala las esclavas al estado real de la maestra (abre/cierra)."""
         ctx = self.masters.get(mid)
@@ -202,6 +240,14 @@ class CopyManager:
             return
 
         async with ctx.lock:
+            # CERROJO 1: no reconciliar con un estado a medio sincronizar. Abrir o
+            # cerrar sobre un snapshot incompleto puede provocar cierres masivos
+            # erróneos en la esclava (dinero real).
+            if not _connection_ready(ctx.connection):
+                log.warning("Copy: maestra %s aún no sincronizada; se pospone la "
+                            "reconciliación (no se abre ni se cierra).", mid)
+                return
+
             try:
                 positions = ctx.connection.terminal_state.positions or []
             except Exception as exc:  # noqa: BLE001
@@ -212,6 +258,22 @@ class CopyManager:
             master_ids = set(master_pos.keys())
             slaves = ctx.master.get("slaves", [])
             db_id = ctx.master["master_account_id"]
+
+            # CERROJO 2: si el snapshot dice que la maestra NO tiene ninguna posición
+            # pero nosotros creemos tener copias abiertas, podría ser un desync y no
+            # un cierre real. Antes de cerrar en las esclavas, re-verificamos por RPC
+            # el estado real de la maestra. Solo si el RPC también la ve plana damos
+            # el cierre por legítimo; ante cualquier duda, NO cerramos este ciclo.
+            have_open_copies = any(
+                info.get("slave_position_id") for info in ctx.copied.values()
+            )
+            if not master_ids and have_open_copies:
+                if not await self._master_really_flat(mid):
+                    log.warning(
+                        "Copy: maestra %s reporta 0 posiciones pero la verificación "
+                        "por RPC ve posiciones abiertas (posible desync); NO se cierra "
+                        "nada este ciclo.", mid)
+                    return
 
             opened, closed = [], []
 
