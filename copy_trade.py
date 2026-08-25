@@ -7,20 +7,25 @@ MetaApi nos EMPUJA los eventos en el momento exacto en que la maestra abre o
 cierra una posición. Latencia de milisegundos y sin polling de operaciones.
 
 Flujo:
-  - El panel (fuente de verdad) expone en /api/worker/copy-accounts cada maestra
-    con sus esclavas y las operaciones ya copiadas (open_trades).
-  - CopyManager mantiene una conexión streaming viva por maestra + un listener.
-  - Cuando llega un evento de posición -> reconcile(): compara el snapshot real
-    de la maestra (terminal_state.positions) con lo ya copiado y abre lo que
-    falta / cierra lo que la maestra cerró, en cada esclava (vía RPC).
-  - Reporta cada acción al panel (POST /api/worker/copy-trades).
+  - El panel (fuente de verdad de la CONFIG) expone en /api/worker/copy-accounts
+    cada maestra con sus esclavas y las operaciones ya copiadas (open_trades).
+  - CopyManager mantiene, best-effort, una conexión streaming por maestra + un
+    listener SOLO para disparar la reconciliación con baja latencia.
+  - reconcile() lee el estado REAL de la maestra por RPC (get_positions) —esa es
+    la fuente de verdad de las operaciones— y abre lo que falta / cierra lo que la
+    maestra cerró, en cada esclava (vía RPC). Reporta al panel (POST /copy-trades).
 
-El único "polling" que queda es refrescar la configuración (quién sigue a quién)
-cada 60s; eso lo hace metaapi_worker.copy_loop, no este módulo.
+Importante (robustez con dinero real): la copia NO depende de que el streaming
+esté sano. Si la conexión de streaming se degrada o muere, el poll de
+configuración cada 60s (metaapi_worker.copy_loop) igual ejecuta reconcile(), que
+al leer por RPC refleja el estado real. El streaming solo acelera la reacción;
+si falla, se reengancha solo en el siguiente ciclo. Y si el RPC falla, se OMITE
+el ciclo sin cerrar nada (nunca cerramos por un error de lectura).
 """
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from metaapi_cloud_sdk import SynchronizationListener
 
@@ -67,14 +72,13 @@ def _direction_from_type(ptype):
 
 def _connection_ready(conn):
     """
-    True solo si la conexión de streaming está sincronizada y conectada al bróker.
-
-    Reconciliar (sobre todo CERRAR) sobre un estado a medio sincronizar es
-    peligroso: `terminal_state.positions` puede llegar vacío durante un re-sync o
-    reconexión y hacernos creer que la maestra cerró todo. Es defensivo: si el SDK
-    no expone alguna de estas señales, no bloquea (asume listo) — el segundo cerrojo
-    (re-verificación por RPC antes de un cierre masivo) cubre ese caso.
+    True si la conexión de streaming está viva y sincronizada. Solo se usa para
+    decidir si hace falta RECONECTAR el streaming (que sirve para disparar la
+    copia con baja latencia). La CORRECCIÓN de la copia NO depende de esto: el
+    snapshot de la maestra se lee por RPC en cada reconciliación.
     """
+    if conn is None:
+        return False
     if getattr(conn, "synchronized", None) is False:
         return False
     ts = getattr(conn, "terminal_state", None)
@@ -117,8 +121,10 @@ class _MasterListener(SynchronizationListener):
         self.master_mid = master_mid
 
     def _trigger(self):
-        # No bloqueamos el callback del SDK: lanzamos la reconciliación aparte.
-        asyncio.create_task(self.manager.reconcile(self.master_mid))
+        # No bloqueamos el callback del SDK: encolamos una reconciliación coalescida
+        # (varios eventos seguidos -> una sola reconciliación) para no disparar una
+        # llamada RPC por cada tick de precio.
+        self.manager.schedule_reconcile(self.master_mid)
 
     async def on_positions_replaced(self, instance_index, positions):
         self._trigger()
@@ -141,6 +147,7 @@ class MasterCtx:
         self.master = master
         self.connection = None
         self.lock = asyncio.Lock()
+        self.reconcile_pending = False  # hay una reconciliación coalescida encolada
         # (slave_id, master_position_id) -> {"slave_position_id": str|None}
         self.copied = {}
         self.seed(master.get("open_trades", []))
@@ -177,35 +184,71 @@ class CopyManager:
         for mid, m in incoming.items():
             if mid in self.masters:
                 self.masters[mid].update(m)
+                # Si el streaming se cayó/degradó, reengancharlo (best-effort, solo
+                # para latencia). La copia funciona igual por el poll+RPC de abajo.
+                if not _connection_ready(self.masters[mid].connection):
+                    await self._attach_streaming(mid, self.masters[mid])
             else:
                 await self._add_master(mid, m)
             await self.reconcile(mid)  # ponerse al día por si ya había posiciones
 
     async def _add_master(self, mid, master):
+        # La maestra se registra SIEMPRE: la copia se hace por RPC en reconcile(),
+        # así que no depende de que el streaming conecte. El streaming es un extra
+        # de baja latencia que se engancha aparte (best-effort).
         ctx = MasterCtx(master)
+        self.masters[mid] = ctx
+        await self._attach_streaming(mid, ctx)
+
+    async def _attach_streaming(self, mid, ctx):
+        """
+        Abre (o reabre) la conexión de STREAMING de la maestra, solo para disparar
+        la reconciliación con baja latencia cuando abre/cierra. Es best-effort: si
+        falla, la copia sigue funcionando por el poll de config (cada 60s) que lee
+        el estado real por RPC. Cierra primero cualquier streaming previo muerto.
+        """
+        old = ctx.connection
+        ctx.connection = None
+        if old is not None:
+            try:
+                await old.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             account = await self.api.metatrader_account_api.get_account(mid)
-
-            # No intentar suscribir si el terminal aún no conectó al bróker:
-            # evita timeouts y tracebacks de "not connected to broker yet".
             try:
                 await account.reload()
             except Exception:  # noqa: BLE001
                 pass
             if account.connection_status != "CONNECTED":
-                log.warning("Copy: maestra %s aún no conectada al bróker (estado: %s); se reintenta luego.",
+                log.warning("Copy: maestra %s aún no conectada al bróker (estado: %s); "
+                            "se copiará por poll y se reintenta el streaming luego.",
                             mid, account.connection_status)
                 return
 
-            conn = account.get_streaming_connection()
+            # history_start_time reciente = NO descargar el historial completo de la
+            # cuenta al sincronizar el streaming. En cuentas con mucho historial
+            # (miles de operaciones) esa descarga hacía que la sincronización
+            # "no terminara a tiempo" y el streaming quedara en bucle de resync.
+            # Para copiar solo necesitamos posiciones, no historial.
+            recent = datetime.now(timezone.utc) - timedelta(hours=1)
+            conn = account.get_streaming_connection(history_start_time=recent)
             conn.add_synchronization_listener(_MasterListener(self, mid))
             await conn.connect()
-            await conn.wait_synchronized()
+            # Asignamos la conexión YA: los eventos pueden empezar a llegar durante
+            # la sincronización. No bloqueamos indefinidamente en wait_synchronized
+            # (hay cuentas cuyo streaming "no termina de sincronizar a tiempo"): si
+            # tarda, seguimos —la copia va por el poll+RPC, esto es solo latencia—.
             ctx.connection = conn
-            self.masters[mid] = ctx
-            log.info("Copy: streaming conectado a la maestra %s.", mid)
+            try:
+                await asyncio.wait_for(conn.wait_synchronized(), timeout=30)
+                log.info("Copy: streaming conectado a la maestra %s.", mid)
+            except Exception:  # noqa: BLE001
+                log.warning("Copy: streaming de la maestra %s tardó en sincronizar; "
+                            "se usa el poll por RPC mientras tanto.", mid)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Copy: no se pudo conectar el streaming de la maestra %s (%s).", mid, exc)
+            log.warning("Copy: streaming no disponible para maestra %s (%s); "
+                        "se copiará por poll cada 60s.", mid, exc)
 
     async def _remove_master(self, mid):
         ctx = self.masters.pop(mid, None)
@@ -216,64 +259,62 @@ class CopyManager:
                 pass
         log.info("Copy: maestra %s desconectada (ya no tiene esclavas activas).", mid)
 
-    async def _master_really_flat(self, mid):
+    async def reconcile_all(self):
+        """Reconcilia TODAS las maestras (lo llama el poll rápido por RPC)."""
+        for mid in list(self.masters.keys()):
+            try:
+                await self.reconcile(mid)
+            except Exception:  # noqa: BLE001
+                log.exception("Copy: error reconciliando la maestra %s", mid)
+
+    def schedule_reconcile(self, mid):
         """
-        Confirma por RPC (canal independiente del streaming) que la maestra
-        realmente no tiene posiciones abiertas. Devuelve True solo si el RPC la ve
-        plana; devuelve False si ve posiciones O si no se pudo confirmar — en ambos
-        casos preferimos NO cerrar (conservador con dinero real).
+        Encola una reconciliación coalescida para la maestra: si ya hay una en cola,
+        no encola otra (los eventos de streaming pueden llegar en ráfaga —varios por
+        segundo— y cada reconcile hace una lectura RPC). Un debounce corto agrupa la
+        ráfaga en una sola reconciliación que ya leerá el estado más reciente.
         """
+        ctx = self.masters.get(mid)
+        if ctx is None or ctx.reconcile_pending:
+            return
+        ctx.reconcile_pending = True
+        asyncio.create_task(self._debounced_reconcile(mid))
+
+    async def _debounced_reconcile(self, mid):
         try:
-            conn = await self.pool.get(mid)
-            positions = await conn.get_positions()
-            return not positions
-        except Exception as exc:  # noqa: BLE001
-            await self.pool.drop(mid)
-            log.warning("Copy: no se pudo verificar por RPC la maestra %s (%s); "
-                        "no se cierra por precaución.", mid, exc)
-            return False
+            await asyncio.sleep(1.0)  # agrupa la ráfaga de eventos
+        finally:
+            ctx = self.masters.get(mid)
+            if ctx is not None:
+                ctx.reconcile_pending = False
+        await self.reconcile(mid)
 
     async def reconcile(self, mid):
         """Iguala las esclavas al estado real de la maestra (abre/cierra)."""
         ctx = self.masters.get(mid)
-        if ctx is None or ctx.connection is None:
+        if ctx is None:
             return
 
         async with ctx.lock:
-            # CERROJO 1: no reconciliar con un estado a medio sincronizar. Abrir o
-            # cerrar sobre un snapshot incompleto puede provocar cierres masivos
-            # erróneos en la esclava (dinero real).
-            if not _connection_ready(ctx.connection):
-                log.warning("Copy: maestra %s aún no sincronizada; se pospone la "
-                            "reconciliación (no se abre ni se cierra).", mid)
-                return
-
+            # FUENTE DE VERDAD = posiciones REALES de la maestra por RPC. No usamos
+            # el terminal_state del streaming porque puede quedar "congelado" si la
+            # conexión se degrada en silencio (bug observado: la maestra dejaba de
+            # copiar). El RPC refleja el estado real del bróker en este instante.
+            # Si el RPC falla, se OMITE el ciclo (no se abre ni se cierra) — nunca
+            # cerramos por un error de lectura (dinero real).
             try:
-                positions = ctx.connection.terminal_state.positions or []
+                mconn = await self.pool.get(mid)
+                positions = await mconn.get_positions() or []
             except Exception as exc:  # noqa: BLE001
-                log.warning("Copy: sin snapshot de la maestra %s (%s).", mid, exc)
+                await self.pool.drop(mid)
+                log.warning("Copy: no se pudieron leer las posiciones de la maestra %s "
+                            "(%s); se omite este ciclo (no se cierra nada).", mid, exc)
                 return
 
             master_pos = {str(p.get("id")): p for p in positions}
             master_ids = set(master_pos.keys())
             slaves = ctx.master.get("slaves", [])
             db_id = ctx.master["master_account_id"]
-
-            # CERROJO 2: si el snapshot dice que la maestra NO tiene ninguna posición
-            # pero nosotros creemos tener copias abiertas, podría ser un desync y no
-            # un cierre real. Antes de cerrar en las esclavas, re-verificamos por RPC
-            # el estado real de la maestra. Solo si el RPC también la ve plana damos
-            # el cierre por legítimo; ante cualquier duda, NO cerramos este ciclo.
-            have_open_copies = any(
-                info.get("slave_position_id") for info in ctx.copied.values()
-            )
-            if not master_ids and have_open_copies:
-                if not await self._master_really_flat(mid):
-                    log.warning(
-                        "Copy: maestra %s reporta 0 posiciones pero la verificación "
-                        "por RPC ve posiciones abiertas (posible desync); NO se cierra "
-                        "nada este ciclo.", mid)
-                    return
 
             opened, closed = [], []
 

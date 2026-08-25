@@ -95,9 +95,13 @@ METAAPI_TF = {
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
-# Cada cuánto se REFRESCA la configuración de copy (quién sigue a quién). Las
-# operaciones NO se pollean: llegan por eventos de streaming.
+# Cada cuánto se REFRESCA la configuración de copy (quién sigue a quién) y se
+# reengancha el streaming. La copia en sí NO depende de esto.
 COPY_CONFIG_SECONDS = int(os.getenv("COPY_CONFIG_SECONDS", "60"))
+# Cada cuánto se RECONCILIA por RPC el estado real de las maestras (abre/cierra
+# copias). Es el poll rápido que garantiza la copia aunque el streaming falle;
+# los eventos de streaming, si funcionan, adelantan esta reacción.
+RECONCILE_SECONDS = int(os.getenv("RECONCILE_SECONDS", "10"))
 HEALTH_PORT = int(os.getenv("PORT", "8080"))
 
 ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/accounts"
@@ -616,16 +620,19 @@ async def loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
+# Manager de copia compartido entre el bucle de config y el de reconciliación.
+COPY_MANAGER = None
+COPY_MANAGER_TOKEN = None
+
+
 async def copy_loop():
     """
-    Copy-trading por EVENTOS (streaming), sin polling de operaciones.
-
-    Este bucle SOLO refresca la configuración (qué maestras y esclavas hay) cada
-    COPY_CONFIG_SECONDS. Las aperturas/cierres reales las disparan los eventos de
-    streaming dentro de CopyManager, no este bucle.
+    Refresca la CONFIGURACIÓN de copy (qué maestras/esclavas hay) y reengancha el
+    streaming cada COPY_CONFIG_SECONDS. Las aperturas/cierres reales NO dependen de
+    este bucle: las hace reconcile_loop por RPC (y los eventos de streaming, si van,
+    las adelantan). Así la copia funciona aunque el streaming no sincronice.
     """
-    manager = None
-    manager_token = None
+    global COPY_MANAGER, COPY_MANAGER_TOKEN
 
     while True:
         STATUS["copy_cycles"] += 1
@@ -637,10 +644,10 @@ async def copy_loop():
             if not token:
                 log.warning("Copy: el panel no devolvió METAAPI_TOKEN; no se copia.")
             else:
-                if manager is None or token != manager_token:
-                    manager = copy_trade.CopyManager(MetaApi(token), report_copy_trades)
-                    manager_token = token
-                await manager.sync_config(masters)
+                if COPY_MANAGER is None or token != COPY_MANAGER_TOKEN:
+                    COPY_MANAGER = copy_trade.CopyManager(MetaApi(token), report_copy_trades)
+                    COPY_MANAGER_TOKEN = token
+                await COPY_MANAGER.sync_config(masters)
 
             STATUS["copy_last_error"] = None
         except requests.exceptions.HTTPError as exc:
@@ -654,9 +661,26 @@ async def copy_loop():
         await asyncio.sleep(COPY_CONFIG_SECONDS)
 
 
+async def reconcile_loop():
+    """
+    Poll RÁPIDO por RPC: cada RECONCILE_SECONDS iguala las esclavas al estado real
+    de las maestras (abre lo que falta, cierra lo que la maestra cerró). Es la red
+    de seguridad que hace que la copia funcione aunque el streaming esté caído.
+    """
+    while True:
+        try:
+            if COPY_MANAGER is not None:
+                await COPY_MANAGER.reconcile_all()
+        except Exception as exc:  # noqa: BLE001
+            STATUS["copy_last_error"] = str(exc)
+            log.exception("Copy: error en el poll de reconciliación")
+
+        await asyncio.sleep(RECONCILE_SECONDS)
+
+
 async def main():
-    """Corre el bucle de bots y el de copy-trading en paralelo."""
-    await asyncio.gather(loop(), copy_loop())
+    """Corre el bucle de bots, el de config de copy y el poll de reconciliación."""
+    await asyncio.gather(loop(), copy_loop(), reconcile_loop())
 
 
 if __name__ == "__main__":
@@ -671,8 +695,8 @@ if __name__ == "__main__":
         log.error("Define BOT_API_KEY en el entorno o en el archivo .env.")
         raise SystemExit(1)
 
-    log.info("eas-worker iniciado | panel=%s | bots cada %ss | copy por eventos (config cada %ss) | health en :%s",
-             DASHBOARD_URL, POLL_SECONDS, COPY_CONFIG_SECONDS, HEALTH_PORT)
+    log.info("eas-worker iniciado | panel=%s | bots cada %ss | copy: config cada %ss + reconcile RPC cada %ss (streaming best-effort) | health en :%s",
+             DASHBOARD_URL, POLL_SECONDS, COPY_CONFIG_SECONDS, RECONCILE_SECONDS, HEALTH_PORT)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
