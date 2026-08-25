@@ -15,12 +15,13 @@ Flujo:
     la fuente de verdad de las operaciones— y abre lo que falta / cierra lo que la
     maestra cerró, en cada esclava (vía RPC). Reporta al panel (POST /copy-trades).
 
-Importante (robustez con dinero real): la copia NO depende de que el streaming
-esté sano. Si la conexión de streaming se degrada o muere, el poll de
-configuración cada 60s (metaapi_worker.copy_loop) igual ejecuta reconcile(), que
-al leer por RPC refleja el estado real. El streaming solo acelera la reacción;
-si falla, se reengancha solo en el siguiente ciclo. Y si el RPC falla, se OMITE
-el ciclo sin cerrar nada (nunca cerramos por un error de lectura).
+Importante (robustez con dinero real): la copia NO depende del streaming. El
+poll por RPC cada RECONCILE_SECONDS (metaapi_worker.reconcile_loop) es el que
+copia; lee `get_positions()` (estado real, SIN historial). El streaming es
+OPCIONAL y viene APAGADO por defecto (COPY_STREAMING=1 para activarlo): en
+cuentas con mucho historial su sincronización falla e intenta bajar todo el
+historial, que aquí no hace falta. Si el RPC falla, se OMITE el ciclo sin cerrar
+nada (nunca cerramos por un error de lectura).
 """
 
 import asyncio
@@ -167,11 +168,15 @@ class MasterCtx:
 #  Manager: conexiones streaming por maestra + reconciliación + reporte.
 # --------------------------------------------------------------------------- #
 class CopyManager:
-    def __init__(self, api, report_fn):
+    def __init__(self, api, report_fn, streaming=False):
         self.api = api
         self.report_fn = report_fn
         self.pool = ConnectionPool(api)   # conexiones RPC a las esclavas
         self.masters = {}                 # metaapi_account_id -> MasterCtx
+        # El streaming (baja latencia por eventos) es OPCIONAL y viene apagado por
+        # defecto: en cuentas con mucho historial su sincronización falla y encima
+        # intenta descargar todo el historial. La copia NO lo necesita —va por RPC—.
+        self.streaming = streaming
 
     async def sync_config(self, masters):
         """Añade maestras nuevas, actualiza las existentes y quita las que ya no están."""
@@ -184,9 +189,9 @@ class CopyManager:
         for mid, m in incoming.items():
             if mid in self.masters:
                 self.masters[mid].update(m)
-                # Si el streaming se cayó/degradó, reengancharlo (best-effort, solo
-                # para latencia). La copia funciona igual por el poll+RPC de abajo.
-                if not _connection_ready(self.masters[mid].connection):
+                # Si el streaming está habilitado y se cayó/degradó, reengancharlo
+                # (best-effort, solo para latencia). La copia funciona igual por RPC.
+                if self.streaming and not _connection_ready(self.masters[mid].connection):
                     await self._attach_streaming(mid, self.masters[mid])
             else:
                 await self._add_master(mid, m)
@@ -198,7 +203,8 @@ class CopyManager:
         # de baja latencia que se engancha aparte (best-effort).
         ctx = MasterCtx(master)
         self.masters[mid] = ctx
-        await self._attach_streaming(mid, ctx)
+        if self.streaming:
+            await self._attach_streaming(mid, ctx)
 
     async def _attach_streaming(self, mid, ctx):
         """

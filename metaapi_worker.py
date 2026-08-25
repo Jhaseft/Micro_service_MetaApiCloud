@@ -102,6 +102,11 @@ COPY_CONFIG_SECONDS = int(os.getenv("COPY_CONFIG_SECONDS", "60"))
 # copias). Es el poll rápido que garantiza la copia aunque el streaming falle;
 # los eventos de streaming, si funcionan, adelantan esta reacción.
 RECONCILE_SECONDS = int(os.getenv("RECONCILE_SECONDS", "10"))
+# Streaming de baja latencia (eventos). APAGADO por defecto: en cuentas con mucho
+# historial su sincronización falla y encima descarga el historial completo, que
+# NO necesitamos para copiar. Con RPC cada RECONCILE_SECONDS basta. Actívalo con
+# COPY_STREAMING=1 solo si tus cuentas son ligeras y quieres latencia sub-segundo.
+COPY_STREAMING = os.getenv("COPY_STREAMING", "0").strip().lower() in ("1", "true", "yes")
 HEALTH_PORT = int(os.getenv("PORT", "8080"))
 
 ACCOUNTS_ENDPOINT = f"{DASHBOARD_URL}/api/worker/accounts"
@@ -645,7 +650,9 @@ async def copy_loop():
                 log.warning("Copy: el panel no devolvió METAAPI_TOKEN; no se copia.")
             else:
                 if COPY_MANAGER is None or token != COPY_MANAGER_TOKEN:
-                    COPY_MANAGER = copy_trade.CopyManager(MetaApi(token), report_copy_trades)
+                    COPY_MANAGER = copy_trade.CopyManager(
+                        MetaApi(token), report_copy_trades, streaming=COPY_STREAMING
+                    )
                     COPY_MANAGER_TOKEN = token
                 await COPY_MANAGER.sync_config(masters)
 
@@ -695,8 +702,9 @@ if __name__ == "__main__":
         log.error("Define BOT_API_KEY en el entorno o en el archivo .env.")
         raise SystemExit(1)
 
-    log.info("eas-worker iniciado | panel=%s | bots cada %ss | copy: config cada %ss + reconcile RPC cada %ss (streaming best-effort) | health en :%s",
-             DASHBOARD_URL, POLL_SECONDS, COPY_CONFIG_SECONDS, RECONCILE_SECONDS, HEALTH_PORT)
+    log.info("eas-worker iniciado | panel=%s | bots cada %ss | copy: config cada %ss + reconcile RPC cada %ss | streaming=%s | health en :%s",
+             DASHBOARD_URL, POLL_SECONDS, COPY_CONFIG_SECONDS, RECONCILE_SECONDS,
+             "on" if COPY_STREAMING else "off", HEALTH_PORT)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
