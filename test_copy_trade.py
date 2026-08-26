@@ -12,6 +12,7 @@ Ejecutar:  python test_copy_trade.py
 """
 
 import asyncio
+import time
 
 import copy_trade
 
@@ -228,9 +229,39 @@ async def test_streaming_alive_vs_ready():
     print("OK  test_streaming_alive_vs_ready (no reconstruye si sigue sincronizando)")
 
 
+async def test_giveup_streaming_to_rpc_only():
+    # Websocket vivo pero que NUNCA sincroniza (cuenta pesada). Al pasar el deadline,
+    # reconcile lo descarta a RPC-only y copia por el fallback RPC.
+    import copy_trade as ct
+    closed_flag = {"v": False}
+
+    class NeverSyncStream:
+        def __init__(self):
+            self.synchronized = False
+            self.terminal_state = FakeTerminalState([], connected=True)
+            self.health_monitor = FakeHealthMonitor(healthy=False)
+        async def close(self):
+            closed_flag["v"] = True
+
+    master = NeverSyncStream()
+    master_rpc = FakeMasterRpc([_pos("777", "POSITION_TYPE_BUY", "XAUUSD", 0.01)])
+    slave = FakeSlaveConn()
+    mgr, ctx, reports = _make_manager(master, slave, master_rpc=master_rpc)
+    ctx.stream_deadline = time.monotonic() - 1  # ya venció
+
+    await mgr.reconcile("master-mid")
+
+    assert ctx.rpc_only is True, "debe pasar a RPC-only"
+    assert ctx.connection is None
+    assert closed_flag["v"] is True, "debe cerrar el websocket descartado"
+    assert len(slave.opened) == 1, "copia por RPC tras descartar el websocket"
+    print("OK  test_giveup_streaming_to_rpc_only (auto-degradación a RPC)")
+
+
 async def main():
     await test_streaming_ready_guards()
     await test_streaming_alive_vs_ready()
+    await test_giveup_streaming_to_rpc_only()
     await test_open_via_streaming()
     await test_close_when_master_closes()
     await test_no_duplicate_open()

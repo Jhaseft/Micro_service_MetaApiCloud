@@ -26,6 +26,7 @@ Robustez (dinero real):
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from metaapi_cloud_sdk import SynchronizationListener
@@ -39,6 +40,12 @@ STREAM_HISTORY_HOURS = 1
 # Tiempo máximo que esperamos a que el streaming sincronice al conectar (no bloquea la
 # copia: si tarda, seguimos y usamos el fallback por RPC hasta que sincronice).
 STREAM_SYNC_TIMEOUT = 30
+# Si el websocket NO logra sincronizar en este tiempo (cuentas muy pesadas cuyo sync
+# no termina nunca, p. ej. brókers con miles de símbolos), lo cerramos y la maestra
+# pasa a RPC-only: deja de gastar resync inútil, libera la suscripción y el RPC —que
+# sí funciona en esas cuentas— la lleva. Las cuentas ligeras sincronizan y NO llegan
+# aquí (se quedan en modo instantáneo por websocket).
+STREAM_GIVEUP_SECONDS = 180
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +212,8 @@ class MasterCtx:
         self.connection = None          # StreamingMetaApiConnectionInstance (websocket)
         self.lock = asyncio.Lock()
         self.reconcile_pending = False  # hay una reconciliación coalescida encolada
+        self.rpc_only = False           # el websocket se descartó -> copiar por RPC
+        self.stream_deadline = None     # monotonic hasta el que damos margen al sync
         # (slave_id, master_position_id) -> {"slave_position_id": str|None}
         self.copied = {}
         self.seed(master.get("open_trades", []))
@@ -244,9 +253,11 @@ class CopyManager:
                 # Reenganchar el websocket SOLO si de verdad se cayó (no si está vivo
                 # pero aún sincronizando): reconstruirlo por "no listo" lo dejaba en
                 # bucle de resync en la cuenta pesada. Mientras sincroniza, la copia
-                # va por el fallback RPC; cuando sincronice, pasa a instantáneo.
-                if not _streaming_alive(self.masters[mid].connection):
-                    await self._attach_streaming(mid, self.masters[mid])
+                # va por el fallback RPC; cuando sincronice, pasa a instantáneo. Si la
+                # maestra ya se descartó a RPC-only, no reintentamos el websocket.
+                ctx = self.masters[mid]
+                if not ctx.rpc_only and not _streaming_alive(ctx.connection):
+                    await self._attach_streaming(mid, ctx)
             else:
                 await self._add_master(mid, m)
             await self.reconcile(mid)  # ponerse al día por si ya había posiciones
@@ -291,8 +302,12 @@ class CopyManager:
             # sincronización. Si el wait_synchronized tarda, seguimos: la copia usa el
             # fallback por RPC hasta que el websocket termine de sincronizar.
             ctx.connection = conn
+            # Damos margen para que sincronice; si lo supera sin lograrlo, reconcile()
+            # lo descartará a RPC-only (ver _maybe_giveup_streaming).
+            ctx.stream_deadline = time.monotonic() + STREAM_GIVEUP_SECONDS
             try:
                 await asyncio.wait_for(conn.wait_synchronized(), timeout=STREAM_SYNC_TIMEOUT)
+                ctx.stream_deadline = None  # sincronizó: nos quedamos con el websocket
                 log.info("Copy: websocket sincronizado con la maestra %s.", mid)
             except Exception:  # noqa: BLE001
                 log.warning("Copy: el websocket de la maestra %s tardó en sincronizar; "
@@ -340,6 +355,30 @@ class CopyManager:
                 ctx.reconcile_pending = False
         await self.reconcile(mid)
 
+    async def _maybe_giveup_streaming(self, mid, ctx):
+        """
+        Si el websocket lleva demasiado tiempo sin sincronizar (cuenta pesada cuyo sync
+        no termina nunca), lo cerramos y pasamos la maestra a RPC-only: dejamos de
+        gastar resync inútil, liberamos la suscripción y la copia sigue por RPC (que sí
+        funciona en esas cuentas). Si el websocket sí sincronizó, no hacemos nada.
+        """
+        if ctx.rpc_only or ctx.connection is None:
+            return
+        if _streaming_ready(ctx.connection):
+            ctx.stream_deadline = None  # sincronizó -> nos quedamos con el websocket
+            return
+        if ctx.stream_deadline is not None and time.monotonic() > ctx.stream_deadline:
+            log.warning("Copy: el websocket de la maestra %s no sincronizó en %ss; se "
+                        "descarta y se copia por RPC (evita el resync inútil y libera la "
+                        "suscripción).", mid, STREAM_GIVEUP_SECONDS)
+            try:
+                await ctx.connection.close()
+            except Exception:  # noqa: BLE001
+                pass
+            ctx.connection = None
+            ctx.rpc_only = True
+            ctx.stream_deadline = None
+
     async def _read_master_positions(self, mid, ctx):
         """
         Posiciones ABIERTAS reales de la maestra. Devuelve (positions, ok).
@@ -374,6 +413,7 @@ class CopyManager:
             return
 
         async with ctx.lock:
+            await self._maybe_giveup_streaming(mid, ctx)
             positions, ok = await self._read_master_positions(mid, ctx)
             if not ok:
                 return  # no se pudo leer con garantías -> no tocamos nada
