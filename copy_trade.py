@@ -127,6 +127,26 @@ def _streaming_ready(conn):
     return True
 
 
+def _streaming_alive(conn):
+    """
+    True si la conexión existe y sigue CONECTADA al servidor de MetaApi, AUNQUE
+    todavía no haya terminado de sincronizar. Sirve para decidir si hay que
+    REENGANCHAR el websocket: si está vivo (aunque sincronizando), lo dejamos
+    terminar; NO lo reconstruimos en bucle cada refresco de config (eso es lo que
+    provocaba el churn de "resynchronized ... did not finish in time" cada 60s en
+    la cuenta pesada). Solo se reengancha si de verdad se cayó.
+    """
+    if conn is None:
+        return False
+    ts = getattr(conn, "terminal_state", None)
+    if ts is None:
+        return False
+    try:
+        return bool(ts.connected)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slave_lot(master_lot, slave):
     """Lote a abrir en la esclava según su modo de copia (mín. 0.01)."""
     mode = slave.get("copy_mode", "multiplier")
@@ -221,8 +241,11 @@ class CopyManager:
         for mid, m in incoming.items():
             if mid in self.masters:
                 self.masters[mid].update(m)
-                # Si el websocket se cayó/degradó, reengancharlo (best-effort).
-                if not _streaming_ready(self.masters[mid].connection):
+                # Reenganchar el websocket SOLO si de verdad se cayó (no si está vivo
+                # pero aún sincronizando): reconstruirlo por "no listo" lo dejaba en
+                # bucle de resync en la cuenta pesada. Mientras sincroniza, la copia
+                # va por el fallback RPC; cuando sincronice, pasa a instantáneo.
+                if not _streaming_alive(self.masters[mid].connection):
                     await self._attach_streaming(mid, self.masters[mid])
             else:
                 await self._add_master(mid, m)

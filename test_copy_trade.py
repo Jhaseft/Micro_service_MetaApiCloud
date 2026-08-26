@@ -18,9 +18,10 @@ import copy_trade
 
 # --------------------------- Fakes (sin red) ------------------------------- #
 class FakeTerminalState:
-    def __init__(self, positions, connected_to_broker=True):
+    def __init__(self, positions, connected_to_broker=True, connected=True):
         self._positions = positions
         self.connected_to_broker = connected_to_broker
+        self.connected = connected
 
     @property
     def positions(self):
@@ -39,9 +40,9 @@ class FakeHealthMonitor:
 
 class FakeStreamingConn:
     """Simula StreamingMetaApiConnectionInstance (maestra)."""
-    def __init__(self, positions, synchronized=True, healthy=True, connected_to_broker=True):
+    def __init__(self, positions, synchronized=True, healthy=True, connected_to_broker=True, connected=True):
         self.synchronized = synchronized
-        self.terminal_state = FakeTerminalState(positions, connected_to_broker)
+        self.terminal_state = FakeTerminalState(positions, connected_to_broker, connected)
         self.health_monitor = FakeHealthMonitor(healthy)
 
     def set_positions(self, positions):
@@ -214,8 +215,22 @@ async def test_streaming_ready_guards():
     print("OK  test_streaming_ready_guards (sync + broker + health)")
 
 
+async def test_streaming_alive_vs_ready():
+    # Vivo pero SIN sincronizar: NO se debe reenganchar (dejarlo terminar) aunque
+    # no esté "ready". Solo se reengancha si se cayó (connected=False).
+    syncing = FakeStreamingConn([], synchronized=False, connected=True)
+    assert copy_trade._streaming_alive(syncing) is True, "vivo aunque sincronizando"
+    assert copy_trade._streaming_ready(syncing) is False, "no listo para leer aún"
+
+    dead = FakeStreamingConn([], connected=False)
+    assert copy_trade._streaming_alive(dead) is False, "caído -> reenganchar"
+    assert copy_trade._streaming_alive(None) is False
+    print("OK  test_streaming_alive_vs_ready (no reconstruye si sigue sincronizando)")
+
+
 async def main():
     await test_streaming_ready_guards()
+    await test_streaming_alive_vs_ready()
     await test_open_via_streaming()
     await test_close_when_master_closes()
     await test_no_duplicate_open()
