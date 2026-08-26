@@ -49,8 +49,19 @@ class ConnectionPool:
             return conn
         account = await self.api.metatrader_account_api.get_account(account_id)
         conn = account.get_rpc_connection()
-        await conn.connect()
-        await conn.wait_synchronized(60)
+        try:
+            await conn.connect()
+            await conn.wait_synchronized(60)
+        except Exception:
+            # Si connect()/wait_synchronized falla (p. ej. "Timed out waiting for
+            # MetaApi to synchronize"), la conexión YA quedó medio abierta. Si no la
+            # cerramos, cada ciclo fallido filtra una conexión: se acumulan, saturan
+            # la sincronización de MetaApi y provocan MÁS timeouts (círculo vicioso).
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         self._conns[account_id] = conn
         return conn
 

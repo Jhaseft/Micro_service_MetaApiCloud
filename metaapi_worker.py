@@ -536,8 +536,8 @@ async def is_broker_connected(account, account_id):
     return True
 
 
-async def process_account(api, account_data):
-    """Conecta una cuenta MetaApi y procesa sus bots activos."""
+async def process_account(api, pool, account_data):
+    """Procesa los bots de una cuenta reusando su conexión RPC del pool."""
     account_id = account_data["metaapi_account_id"]
     broker_account_id = account_data.get("broker_account_id")
     bots = account_data.get("bots", [])
@@ -550,15 +550,18 @@ async def process_account(api, account_data):
         return
 
     log.info("Cuenta %s: procesando %s bot(s)...", account_id, len(bots))
-    connection = account.get_rpc_connection()
-    await connection.connect()
+    # Reusamos la conexión RPC entre ciclos (la cachea el pool). Antes se hacía
+    # get_rpc_connection()+connect()+wait_synchronized()+close() CADA ciclo: ese
+    # churn constante saturaba la sincronización de MetaApi (y con POLL_SECONDS bajo
+    # dejaba sin turno al reconcile de copia -> timeouts). Reusar es lo correcto.
     try:
-        try:
-            await connection.wait_synchronized(60)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Cuenta %s: no sincronizó a tiempo (%s); se reintenta luego.", account_id, exc)
-            return
+        connection = await pool.get(account_id)
+    except Exception as exc:  # noqa: BLE001
+        await pool.drop(account_id)
+        log.warning("Cuenta %s: no sincronizó a tiempo (%s); se reintenta luego.", account_id, exc)
+        return
 
+    try:
         for bot in bots:
             # 1) Trailing stop: protege posiciones abiertas SIEMPRE (incluso fuera
             #    de horario), porque ya hay dinero en riesgo.
@@ -571,11 +574,15 @@ async def process_account(api, account_data):
                 continue
             for symbol in bot.get("symbols", []):
                 await open_operation(account, connection, bot, symbol, broker_account_id)
-    finally:
-        await connection.close()
+    except Exception:
+        # Si algo falla operando, soltamos la conexión para forzar una reconexión
+        # limpia el próximo ciclo (no quedarnos pegados a una conexión degradada).
+        await pool.drop(account_id)
+        raise
 
 
 async def loop():
+    global TRADE_API, TRADE_API_TOKEN, TRADE_POOL
     while True:
         cycle_start = time.time()
         STATUS["cycles"] += 1
@@ -588,11 +595,17 @@ async def loop():
             if not token:
                 log.warning("El panel no devolvió METAAPI_TOKEN. Configuralo en el .env del panel.")
             else:
-                api = MetaApi(token)
+                # Reusamos el cliente MetaApi y su pool de conexiones entre ciclos.
+                # Antes se creaba un MetaApi NUEVO cada ciclo (nueva conexión websocket
+                # que nunca se cerraba) -> otra fuga que saturaba la sincronización.
+                if TRADE_API is None or token != TRADE_API_TOKEN:
+                    TRADE_API = MetaApi(token)
+                    TRADE_API_TOKEN = token
+                    TRADE_POOL = copy_trade.ConnectionPool(TRADE_API)
                 log.info("Cuentas operables: %s", len(accounts))
                 for account_data in accounts:
                     try:
-                        await process_account(api, account_data)
+                        await process_account(TRADE_API, TRADE_POOL, account_data)
                     except Exception as exc:  # noqa: BLE001
                         STATUS["last_error"] = str(exc)
                         log.exception("Cuenta %s: error", account_data.get("metaapi_account_id"))
@@ -628,6 +641,12 @@ async def loop():
 # Manager de copia compartido entre el bucle de config y el de reconciliación.
 COPY_MANAGER = None
 COPY_MANAGER_TOKEN = None
+
+# Cliente MetaApi y pool de conexiones del bucle de TRADING, persistentes entre
+# ciclos: se reusan en vez de recrearse (y reconectar) cada ciclo.
+TRADE_API = None
+TRADE_API_TOKEN = None
+TRADE_POOL = None
 
 
 async def copy_loop():
